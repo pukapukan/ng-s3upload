@@ -26,17 +26,14 @@ angular.module('ngS3upload',
         'ngS3upload.services',
         'ngSanitize'
     ]);
-angular.module('ngS3upload.config', []).
-  constant('ngS3Config', {
-    theme: 'bootstrap2'
-  });angular.module('ngS3upload.services', []).
+angular.module('ngS3upload.services', []).
   service('S3Uploader', ['$http', '$q', '$window', function ($http, $q, $window) {
     this.uploads = 0;
     var self = this;
 
-    this.getUploadOptions = function (uri) {
+    this.getUploadOptions = function (uri, params) {
       var deferred = $q.defer();
-      $http.get(uri).
+      $http.get(uri, { params: params }).
         success(function (response, status) {
           deferred.resolve(response);
         }).error(function (error, status) {
@@ -46,29 +43,25 @@ angular.module('ngS3upload.config', []).
       return deferred.promise;
     };
 
-    this.randomString = function (length) {
-      var chars = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
-      var result = '';
-      for (var i = length; i > 0; --i) result += chars[Math.round(Math.random() * (chars.length - 1))];
-
-      return result;
+    this.createCORSRequest = function(method, url) {
+      var xhr;
+      xhr = new XMLHttpRequest();
+      if (!xhr.withCredentials) {
+        xhr.open(method, url, true);
+      } else if (typeof XDomainRequest !== "undefined") {
+        xhr = new XDomainRequest();
+        xhr.open(method, url);
+      } else {
+        xhr = null;
+      }
+      return xhr;
     };
 
-
-    this.upload = function (scope, uri, key, acl, type, accessKey, policy, signature, file) {
+    this.uploadFile = function (scope, signedUrl, publicUrl, file) {
       var deferred = $q.defer();
       scope.attempt = true;
 
-      var fd = new FormData();
-      fd.append('key', key);
-      fd.append('acl', acl);
-      fd.append('Content-Type', file.type);
-      fd.append('AWSAccessKeyId', accessKey);
-      fd.append('policy', policy);
-      fd.append('signature', signature);
-      fd.append("file", file);
-
-      var xhr = new XMLHttpRequest();
+      var xhr = this.createCORSRequest('PUT', signedUrl);
       xhr.upload.addEventListener("progress", uploadProgress, false);
       xhr.addEventListener("load", uploadComplete, false);
       xhr.addEventListener("error", uploadFailed, false);
@@ -88,7 +81,6 @@ angular.module('ngS3upload.config', []).
           if (typeof deferred.notify === 'function') {
             deferred.notify(msg);
           }
-
         });
       }
       function uploadComplete(e) {
@@ -96,10 +88,10 @@ angular.module('ngS3upload.config', []).
         scope.$apply(function () {
           self.uploads--;
           scope.uploading = false;
-          if (xhr.status === 204) { // successful upload
+          if (xhr.status === 200) { // successful upload
             scope.success = true;
             deferred.resolve(xhr);
-            scope.$emit('s3upload:success', xhr, {path: uri + key});
+            scope.$emit('s3upload:success', xhr, {path: publicUrl});
           } else {
             scope.success = false;
             deferred.reject(xhr);
@@ -108,6 +100,8 @@ angular.module('ngS3upload.config', []).
         });
       }
       function uploadFailed(e) {
+        console.log('FAILED!', e);
+
         var xhr = e.srcElement || e.target;
         scope.$apply(function () {
           self.uploads--;
@@ -131,8 +125,7 @@ angular.module('ngS3upload.config', []).
       // Send the file
       scope.uploading = true;
       this.uploads++;
-      xhr.open('POST', uri, true);
-      xhr.send(fd);
+      xhr.send(file);
 
       return deferred.promise;
     };
@@ -142,10 +135,11 @@ angular.module('ngS3upload.config', []).
     };
   }]);
 angular.module('ngS3upload.directives', []).
-  directive('s3Upload', ['$parse', 'S3Uploader', 'ngS3Config', function ($parse, S3Uploader, ngS3Config) {
+  directive('s3Upload', ['$parse', 'S3Uploader', function ($parse, S3Uploader) {
     return {
       restrict: 'AC',
       require: '?ngModel',
+      templateUrl: 'partials/shared/fileupload.html',
       replace: true,
       transclude: false,
       scope: true,
@@ -198,25 +192,22 @@ angular.module('ngS3upload.directives', []).
               var filename = selectedFile.name;
               var ext = filename.split('.').pop();
 
-              S3Uploader.getUploadOptions(opts.getOptionsUri).then(function (s3Options) {
+              S3Uploader.getUploadOptions(opts.getOptionsUri, { 'content-type': selectedFile.type }).then(function (s3Options) {
                 if (opts.enableValidation) {
                   ngModel.$setValidity('uploading', false);
                 }
 
-                var s3Uri = 'https://' + bucket + '.s3.amazonaws.com/';
-                var key = opts.targetFilename ? scope.$eval(opts.targetFilename) : opts.folder + (new Date()).getTime() + '-' + S3Uploader.randomString(16) + "." + ext;
-                S3Uploader.upload(scope,
-                    s3Uri,
-                    key,
-                    opts.acl,
-                    selectedFile.type,
-                    s3Options.key,
-                    s3Options.policy,
-                    s3Options.signature,
+                var signedUrl = s3Options.signedUrl;
+                var publicUrl = s3Options.publicUrl;
+
+                S3Uploader.uploadFile(scope,
+                    signedUrl,
+                    publicUrl,
                     selectedFile
                   ).then(function () {
-                    ngModel.$setViewValue(s3Uri + key);
+                    ngModel.$setViewValue(publicUrl);
                     scope.filename = ngModel.$viewValue;
+                    scope.uploadedFiles.push(publicUrl);
 
                     if (opts.enableValidation) {
                       ngModel.$setValidity('uploading', true);
@@ -235,8 +226,6 @@ angular.module('ngS3upload.directives', []).
                 throw Error("Can't receive the needed options for S3 " + error);
               });
 
-            };
-
             element.bind('change', function (nVal) {
               if (opts.submitOnChange) {
                 scope.$apply(function () {
@@ -250,15 +239,12 @@ angular.module('ngS3upload.directives', []).
                 if (value) uploadFile();
               });
             }
-          }
-        };
-      },
-      templateUrl: function(elm, attrs) {
-        var theme = attrs.theme || ngS3Config.theme;
-        return 'theme/' + theme + '.html';
-      }
-    };
-  }]);
+          };
+        }
+      };
+    }
+  };
+}]);
 angular.module('ngS3upload').run(['$templateCache', function($templateCache) {
   'use strict';
 
